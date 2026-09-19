@@ -43,9 +43,40 @@ After a run, an undo button returns those sections to their home courses. That b
 
 Every completed run also prints a copyable audit record: an ISO timestamp, the destination course with its SIS ID and course code, and one line per section giving the section ID, its SIS ID, and the home course it came from. Copy it into your ticket or change log before you close the tab. It is your change-management artifact, and it is also your manual recovery path, since returning a section by hand means opening the primary course, going to **Settings > Sections**, and de-cross-listing it back to the course named in the record.
 
+### Add or remove one enrollment
+
+Puts one person on one section in one role, or takes them off it, including in courses the enrollments API refuses to touch.
+
+- **Version:** 1.1.0
+- **Where to run it:** any page on your Canvas instance. It works best from the account page you actually mean, since SIS imports run at the account level.
+- **Permissions needed:** the Import SIS Data permission on your admin role.
+- **Last tested:** 2026-09-18, Chrome and Firefox, against a Canvas production instance.
+
+Search for the user, search for the course, pick the section, choose the role and whether you are adding or removing. The panel shows you the exact two-line CSV it will send before you send it, and a plain-language sentence describing what happens.
+
+#### Why a SIS import instead of the enrollments API
+
+`EnrollmentsApiController#create` refuses to add an enrollment to a concluded course. Every fall, someone needs a designer on last spring's section to pull content out of it, and the supported path is to unconclude the course, add the person, and remember to conclude it again later. The SIS importer does not enforce that guard, so a two-row CSV reaches concluded and past-term courses without changing the course state.
+
+#### Read this before you use it
+
+This is the sharpest tool in the repository, and it deserves more caution than the cross-list helper.
+
+The enrollment it creates becomes SIS-managed. Instructors cannot remove an SIS-managed enrollment from their own course. More importantly, a future SIS import running in batch mode can delete it as an orphan, because your nightly feed has never heard of it. Find out how your institution runs its enrollment imports before you use this on a course the SIS still feeds.
+
+The tool never sends `batch_mode` and never sends `diffing_data_set_identifier`. That is what keeps a two-row CSV from ever sweeping a term. Both omissions are deliberate, and they should stay that way in any fork.
+
+SIS imports run at the account level. If you open the panel from a page that does not name an account, it resolves to your root account, and it tells you so in an amber line when you hold admin rights on more than one. Open the account you actually mean and click the bookmarklet from there.
+
+#### Verification and the audit line
+
+After the import finishes, the panel polls for the result, surfaces any processing warnings or errors Canvas returned, and then re-reads the section roster to confirm the enrollment actually landed. A SIS import that reports success while the roster disagrees is the exact case that check exists to catch.
+
+It then prints a one-line audit record carrying the timestamp, the import ID, the role, the status, the user's SIS ID, the section's SIS ID, and the course. Copy it into your ticket before you close the panel.
+
 ## Installing
 
-Drag the button from the [install page](https://techconsigliere.github.io/canvas-admin-bookmarklets/) to your bookmarks bar. That is the whole process.
+Drag the buttons from the [install page](https://techconsigliere.github.io/canvas-admin-bookmarklets/) to your bookmarks bar. That is the whole process.
 
 If you would rather not drag a link from a web page, the manual route works identically: show your bookmarks bar (`Ctrl/Cmd+Shift+B`), right-click it, choose **Add page** in Chrome or **Add Bookmark** in Firefox, name it whatever you like, and paste the contents of the matching file in `dist/` into the **URL** field.
 

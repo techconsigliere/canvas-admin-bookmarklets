@@ -1,0 +1,807 @@
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------
+     Canvas enrollment helper (bookmarklet) - v1.1.0
+
+     Adds or removes one user on one section using a two-line SIS import
+     rather than the enrollments API. The SIS importer does not enforce
+     the "Can't add an enrollment to a concluded course" guard that lives
+     in EnrollmentsApiController#create, so this reaches concluded and
+     past-term courses without unconcluding anything.
+
+     Read the README before you use this. It needs the Import SIS Data
+     permission, it makes the enrollment SIS-managed, and it is the
+     sharpest tool in this repository.
+
+     It never sends batch_mode and never sends
+     diffing_data_set_identifier. Both are deliberate omissions, and
+     both are the reason this cannot sweep a term.
+
+     Runs inside an already-authenticated Canvas tab. It uses the
+     browser session cookie plus the _csrf_token cookie, so there is no
+     API token in this file and nothing to rotate or leak.
+
+     Everything is built with DOM calls (no eval, no injected script
+     tag, no inline style element), so it survives Canvas's Content
+     Security Policy.
+
+     MIT licensed. See LICENSE in the repository.
+     ------------------------------------------------------------------ */
+
+  var PANEL_ID = 'cbm-enroll-panel';
+  var already = document.getElementById(PANEL_ID);
+  if (already) { already.remove(); return; }
+
+  var HOST = location.origin;
+  var accountId = null;
+  var pickedUser = null;
+  var pickedCourse = null;
+  var sections = [];
+  var pickedSection = null;
+  var pollTimer = null;
+
+  /* ---------- design tokens ------------------------------------------ */
+
+  var INK    = '#2d3b45',
+      MUTED  = '#6b7780',
+      LINE   = '#d7dade',
+      HAIR   = '#eceef0',
+      BLUE   = '#0374b5',
+      BLUEBG = '#e8f4fc',
+      GREEN  = '#0b874b',
+      AMBER  = '#a86200',
+      DANGER = '#c72f4a',
+      SHELL  = '#fbfcfc';
+
+  var FONT = '14px/1.5 Lato, "Helvetica Neue", "Segoe UI", Arial, sans-serif';
+  var MONO = '12px/1.6 "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace';
+
+  /* ---------- Canvas plumbing ---------------------------------------- */
+
+  function csrf() {
+    var m = document.cookie.match(/(?:^|;\s*)_csrf_token=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  function api(path, method) {
+    return fetch(HOST + path, {
+      method: method || 'GET',
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json', 'X-CSRF-Token': csrf() }
+    }).then(readJson);
+  }
+
+  function postCsv(path, csvText) {
+    return fetch(HOST + path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'text/csv',
+        'X-CSRF-Token': csrf()
+      },
+      body: csvText
+    }).then(readJson);
+  }
+
+  function readJson(res) {
+    return res.text().then(function (body) {
+      var data = null;
+      try { data = JSON.parse(body.replace(/^while\(1\);/, '')); } catch (e) {}
+      if (!res.ok) {
+        var msg = (data && (data.message ||
+                   (data.errors && JSON.stringify(data.errors)))) ||
+                  (res.status + ' ' + res.statusText);
+        if (res.status === 401 || res.status === 403) {
+          msg = 'Canvas refused the request (' + res.status + '). ' +
+                'Importing SIS data needs the Import SIS Data permission on ' +
+                'your admin role. ' + msg;
+        }
+        throw new Error(msg);
+      }
+      return data;
+    });
+  }
+
+  var accountGuessed = false;
+
+  function resolveAccount() {
+    var m = location.pathname.match(/\/accounts\/(\d+)/);
+    if (m) { accountId = m[1]; return Promise.resolve(accountId); }
+    return api('/api/v1/accounts?per_page=100').then(function (list) {
+      list = list || [];
+      var root = list.filter(function (a) { return !a.parent_account_id; })[0] || list[0];
+      if (!root) { throw new Error('No account available to search from this page.'); }
+      accountId = root.id;
+      accountGuessed = list.length > 1;
+      return accountId;
+    });
+  }
+
+  /* ---------- searches ------------------------------------------------ */
+
+  function searchUsers(term) {
+    return api('/api/v1/accounts/' + accountId + '/users' +
+               '?per_page=25&include[]=email&search_term=' + encodeURIComponent(term))
+      .then(function (list) { return list || []; });
+  }
+
+  function tokensOf(term) {
+    return term.split(/\s+/).filter(function (t) { return t.length > 0; });
+  }
+
+  function matchesAllTokens(c, toks) {
+    var hay = ((c.name || '') + ' ' + (c.course_code || '') + ' ' +
+               (c.sis_course_id || '')).toLowerCase();
+    return toks.every(function (t) { return hay.indexOf(t.toLowerCase()) !== -1; });
+  }
+
+  function courseQuery(term) {
+    return api('/api/v1/accounts/' + accountId + '/courses' +
+               '?per_page=50&include[]=term&include[]=teachers&search_term=' +
+               encodeURIComponent(term))
+      .then(function (list) { return list || []; });
+  }
+
+  function searchCourses(term) {
+    /* Canvas matches search_term as one wildcard string, not as tokens.
+       Try the phrase as typed first, since course names often carry it in
+       that order. If nothing comes back, send the longest token instead
+       and narrow the result set here so word order stops mattering. */
+    return courseQuery(term).then(function (list) {
+      if (list.length) { return list; }
+      var toks = tokensOf(term);
+      if (toks.length < 2) { return []; }
+      var longest = toks.slice().sort(function (a, b) { return b.length - a.length; })[0];
+      if (longest.length < 3) { return []; }
+      return courseQuery(longest).then(function (wide) {
+        return wide.filter(function (c) { return matchesAllTokens(c, toks); });
+      });
+    }).then(function (list) {
+      return list.sort(function (a, b) { return termKey(b) - termKey(a); });
+    });
+  }
+
+  function termKey(c) {
+    /* Canvas already knows when each term starts, and every institution
+       names its own terms. Sorting on term.start_at works on quarters,
+       semesters, trimesters and anything else. Courses parked in the
+       Default Term have no start date, so fall back to creation date. */
+    if (c.term && c.term.start_at) { return Date.parse(c.term.start_at); }
+    if (c.created_at) { return Date.parse(c.created_at); }
+    return 0;
+  }
+
+  function termLabel(c) {
+    return (c.term && c.term.name) || 'no term';
+  }
+
+  /* ---------- tiny DOM helpers ---------------------------------------- */
+
+  function el(tag, styles, text) {
+    var e = document.createElement(tag);
+    if (styles) { for (var k in styles) { e.style[k] = styles[k]; } }
+    if (text != null) { e.textContent = text; }
+    return e;
+  }
+
+  function button(text, kind) {
+    var solid = kind === 'primary';
+    var warn = kind === 'danger';
+    var b = el('button', {
+      font: 'inherit',
+      fontSize: '14px',
+      fontWeight: (solid || warn) ? '700' : '400',
+      padding: '9px 16px',
+      borderRadius: '4px',
+      cursor: 'pointer',
+      border: '1px solid ' + (solid ? BLUE : (warn ? DANGER : LINE)),
+      background: solid ? BLUE : (warn ? DANGER : '#fff'),
+      color: (solid || warn) ? '#fff' : INK,
+      lineHeight: '1.3'
+    }, text);
+    b.type = 'button';
+    b.addEventListener('focus', function () {
+      b.style.outline = '2px solid ' + BLUE;
+      b.style.outlineOffset = '2px';
+    });
+    b.addEventListener('blur', function () { b.style.outline = 'none'; });
+    return b;
+  }
+
+  function fieldLabel(text) {
+    return el('label', {
+      display: 'block', fontWeight: '700', marginBottom: '5px', fontSize: '14px'
+    }, text);
+  }
+
+  function userMain(u) {
+    return u.sortable_name || u.name || '(unnamed)';
+  }
+
+  function userSub(u) {
+    return 'login ' + (u.login_id || 'none') +
+           '  \u00b7  SIS ' + (u.sis_user_id || 'none') +
+           '  \u00b7  ' + (u.email || 'no email') +
+           '  \u00b7  id ' + u.id;
+  }
+
+  function courseMain(c) {
+    return c.name || '(unnamed)';
+  }
+
+  function courseSub(c) {
+    var teach = (c.teachers || []).map(function (t) { return t.display_name; })
+                  .slice(0, 2).join(', ');
+    return 'SIS ' + (c.sis_course_id || 'none') +
+           '  \u00b7  ' + (c.course_code || 'no code') +
+           '  \u00b7  ' + termLabel(c) +
+           '  \u00b7  id ' + c.id +
+           (teach ? '  \u00b7  ' + teach : '') +
+           (c.workflow_state === 'completed' ? '  \u00b7  concluded' : '') +
+           (c.workflow_state === 'unpublished' ? '  \u00b7  unpublished' : '');
+  }
+
+  /* ---------- the type-ahead box -------------------------------------- */
+
+  function combo(labelText, placeholder, runSearch, mainOf, subOf, onPick) {
+    var wrap = el('div', { position: 'relative' });
+    wrap.appendChild(fieldLabel(labelText));
+
+    var input = el('input', {
+      width: '100%', boxSizing: 'border-box', padding: '9px 10px',
+      border: '1px solid ' + LINE, borderRadius: '4px',
+      font: 'inherit', fontSize: '14px', color: INK, background: '#fff'
+    });
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.placeholder = placeholder;
+    input.addEventListener('focus', function () {
+      input.style.borderColor = BLUE;
+      input.style.boxShadow = 'inset 0 0 0 1px ' + BLUE;
+    });
+    input.addEventListener('blur', function () {
+      input.style.borderColor = LINE;
+      input.style.boxShadow = 'none';
+    });
+
+    var menu = el('div', {
+      position: 'absolute', left: '0', right: '0', top: '100%', marginTop: '2px',
+      background: '#fff', border: '1px solid ' + LINE, borderRadius: '4px',
+      boxShadow: '0 4px 14px rgba(0,0,0,.16)', maxHeight: '300px',
+      overflowY: 'auto', display: 'none', zIndex: '10'
+    });
+    var picked = el('div', {
+      marginTop: '7px', fontSize: '13px', color: BLUE, lineHeight: '1.4'
+    });
+
+    var timer = null, rows = [], cursor = -1;
+
+    function closeMenu() { menu.style.display = 'none'; rows = []; cursor = -1; }
+
+    function highlight(i) {
+      var kids = menu.children;
+      for (var n = 0; n < kids.length; n++) {
+        kids[n].style.background = (n === i) ? BLUEBG : '#fff';
+      }
+      cursor = i;
+      if (kids[i]) { kids[i].scrollIntoView({ block: 'nearest' }); }
+    }
+
+    function choose(item) {
+      closeMenu();
+      input.value = mainOf(item);
+      picked.textContent = subOf(item);
+      onPick(item);
+    }
+
+    function render(list) {
+      menu.textContent = '';
+      rows = list;
+      if (!list.length) {
+        menu.appendChild(el('div', { padding: '10px', color: MUTED, fontSize: '13px' },
+          'Nothing matched. Try fewer words, or the SIS ID.'));
+        menu.style.display = 'block';
+        return;
+      }
+      list.forEach(function (item, i) {
+        var row = el('div', {
+          padding: '8px 10px', cursor: 'pointer',
+          borderBottom: '1px solid ' + HAIR
+        });
+        row.appendChild(el('div', { fontSize: '13px', lineHeight: '1.35' }, mainOf(item)));
+        row.appendChild(el('div', {
+          fontSize: '12px', color: MUTED, lineHeight: '1.35', marginTop: '1px'
+        }, subOf(item)));
+        row.addEventListener('mouseenter', function () { highlight(i); });
+        row.addEventListener('mousedown', function (ev) { ev.preventDefault(); choose(item); });
+        menu.appendChild(row);
+      });
+      menu.style.display = 'block';
+      highlight(0);
+    }
+
+    input.addEventListener('input', function () {
+      picked.textContent = '';
+      onPick(null);
+      clearTimeout(timer);
+      var term = input.value.trim();
+      if (term.length < 3) { closeMenu(); return; }
+      timer = setTimeout(function () {
+        runSearch(term).then(render).catch(function (err) {
+          menu.textContent = '';
+          menu.appendChild(el('div', { padding: '10px', color: DANGER, fontSize: '13px' },
+            'Search failed: ' + err.message));
+          menu.style.display = 'block';
+        });
+      }, 300);
+    });
+
+    input.addEventListener('keydown', function (ev) {
+      if (menu.style.display === 'none') { return; }
+      if (ev.key === 'ArrowDown') { ev.preventDefault(); highlight(Math.min(cursor + 1, rows.length - 1)); }
+      else if (ev.key === 'ArrowUp') { ev.preventDefault(); highlight(Math.max(cursor - 1, 0)); }
+      else if (ev.key === 'Enter') { ev.preventDefault(); if (rows[cursor]) { choose(rows[cursor]); } }
+      else if (ev.key === 'Escape') { closeMenu(); }
+    });
+
+    input.addEventListener('blur', function () { setTimeout(closeMenu, 150); });
+
+    wrap.appendChild(input);
+    wrap.appendChild(menu);
+    wrap.appendChild(picked);
+    return { wrap: wrap, focus: function () { input.focus(); } };
+  }
+
+  /* ---------- panel shell --------------------------------------------- */
+
+  var panel = el('div', {
+    position: 'fixed', top: '16px', right: '16px', width: '580px', maxHeight: '92vh',
+    zIndex: '99999', background: '#fff', color: INK,
+    border: '1px solid ' + LINE, borderRadius: '8px',
+    boxShadow: '0 10px 40px rgba(0,0,0,.22)',
+    font: FONT, display: 'flex', flexDirection: 'column'
+  });
+  panel.id = PANEL_ID;
+
+  var head = el('div', {
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    padding: '13px 18px', borderBottom: '1px solid ' + LINE,
+    background: SHELL, borderRadius: '8px 8px 0 0', cursor: 'move', flex: '0 0 auto'
+  });
+  var headText = el('div');
+  headText.appendChild(el('div', { fontWeight: '700', fontSize: '16px' }, 'Add a person to a section'));
+  var headSub = el('div', { fontSize: '13px', color: MUTED, marginTop: '2px' }, '');
+  headText.appendChild(headSub);
+  head.appendChild(headText);
+  var closeBtn = button('Close');
+  closeBtn.addEventListener('click', function () {
+    if (pollTimer) { clearTimeout(pollTimer); }
+    panel.remove();
+  });
+  head.appendChild(closeBtn);
+  panel.appendChild(head);
+
+  (function makeDraggable() {
+    var dragging = false, offX = 0, offY = 0;
+    head.addEventListener('mousedown', function (ev) {
+      if (ev.target.tagName === 'BUTTON') { return; }
+      var box = panel.getBoundingClientRect();
+      dragging = true;
+      offX = ev.clientX - box.left;
+      offY = ev.clientY - box.top;
+      panel.style.right = 'auto';
+      panel.style.left = box.left + 'px';
+      panel.style.top = box.top + 'px';
+      ev.preventDefault();
+    });
+    document.addEventListener('mousemove', function (ev) {
+      if (!dragging) { return; }
+      panel.style.left = Math.max(0, ev.clientX - offX) + 'px';
+      panel.style.top = Math.max(0, ev.clientY - offY) + 'px';
+    });
+    document.addEventListener('mouseup', function () { dragging = false; });
+  })();
+
+  var body = el('div', { padding: '18px', overflowY: 'auto', flex: '1 1 auto' });
+  panel.appendChild(body);
+
+  var foot = el('div', {
+    padding: '14px 18px', borderTop: '1px solid ' + LINE, background: SHELL,
+    borderRadius: '0 0 8px 8px', flex: '0 0 auto'
+  });
+  panel.appendChild(foot);
+
+  var csvBox = el('pre', {
+    font: MONO, background: '#fff', border: '1px solid ' + LINE, borderRadius: '4px',
+    padding: '9px 11px', margin: '0 0 10px', whiteSpace: 'pre', overflowX: 'auto',
+    color: INK, display: 'none'
+  });
+  var planText = el('div', { fontSize: '13px', lineHeight: '1.5', marginBottom: '10px' });
+  var actions = el('div', { display: 'flex', gap: '8px', flexWrap: 'wrap' });
+  foot.appendChild(csvBox);
+  foot.appendChild(planText);
+  foot.appendChild(actions);
+
+  function say(text, color) {
+    planText.textContent = text;
+    planText.style.color = color || INK;
+  }
+
+  /* ---------- fields --------------------------------------------------- */
+
+  function card(borderColor) {
+    return el('div', {
+      padding: '14px 16px', border: '1px solid ' + LINE, borderRadius: '6px',
+      borderLeft: '4px solid ' + (borderColor || HAIR), marginBottom: '14px',
+      background: '#fff'
+    });
+  }
+
+  var userCard = card(BLUE);
+  var userCombo = combo(
+    'Person', 'Type 3 or more letters of a name, login, or SIS ID',
+    searchUsers, userMain, userSub,
+    function (u) { pickedUser = u; refreshPlan(); }
+  );
+  userCard.appendChild(userCombo.wrap);
+  body.appendChild(userCard);
+
+  var courseCard = card(BLUE);
+  var courseCombo = combo(
+    'Course', 'Type part of the course name, code, or SIS ID',
+    searchCourses, courseMain, courseSub,
+    function (c) {
+      pickedCourse = c;
+      pickedSection = null;
+      loadSections();
+    }
+  );
+  courseCard.appendChild(courseCombo.wrap);
+  var sectionBox = el('div', { marginTop: '14px' });
+  courseCard.appendChild(sectionBox);
+  body.appendChild(courseCard);
+
+  var optCard = card(HAIR);
+  var optRow = el('div', { display: 'flex', gap: '18px', flexWrap: 'wrap' });
+
+  function selectField(labelText, options, value) {
+    var w = el('div', { flex: '1 1 200px' });
+    w.appendChild(fieldLabel(labelText));
+    var s = el('select', {
+      width: '100%', boxSizing: 'border-box', padding: '8px 9px',
+      border: '1px solid ' + LINE, borderRadius: '4px',
+      font: 'inherit', fontSize: '14px', color: INK, background: '#fff'
+    });
+    options.forEach(function (o) {
+      var opt = el('option', null, o[1]);
+      opt.value = o[0];
+      s.appendChild(opt);
+    });
+    s.value = value;
+    s.addEventListener('change', refreshPlan);
+    w.appendChild(s);
+    return { wrap: w, select: s };
+  }
+
+  var roleField = selectField('Role', [
+    ['teacher', 'Teacher'],
+    ['ta', 'TA'],
+    ['designer', 'Designer'],
+    ['observer', 'Observer'],
+    ['student', 'Student']
+  ], 'teacher');
+
+  var statusField = selectField('Status', [
+    ['active', 'active (add the enrollment)'],
+    ['deleted', 'deleted (remove the enrollment)']
+  ], 'active');
+
+  optRow.appendChild(roleField.wrap);
+  optRow.appendChild(statusField.wrap);
+  optCard.appendChild(optRow);
+  body.appendChild(optCard);
+
+  var log = el('div', { marginTop: '4px', fontSize: '13px' });
+  body.appendChild(log);
+
+  function note(text, color) {
+    log.appendChild(el('div', { color: color || INK, padding: '3px 0', lineHeight: '1.45' }, text));
+    log.scrollIntoView({ block: 'nearest' });
+  }
+
+  /* ---------- sections -------------------------------------------------- */
+
+  function loadSections() {
+    sectionBox.textContent = '';
+    sections = [];
+    refreshPlan();
+    if (!pickedCourse) { return; }
+    sectionBox.appendChild(el('div', { color: MUTED, fontSize: '13px' }, 'Loading sections\u2026'));
+    api('/api/v1/courses/' + pickedCourse.id +
+        '/sections?per_page=100&include[]=total_students')
+      .then(function (list) {
+        sections = list || [];
+        renderSections();
+        refreshPlan();
+      })
+      .catch(function (err) {
+        sectionBox.textContent = '';
+        sectionBox.appendChild(el('div', { color: DANGER, fontSize: '13px' },
+          'Could not load sections: ' + err.message));
+      });
+  }
+
+  function renderSections() {
+    sectionBox.textContent = '';
+    if (!sections.length) {
+      sectionBox.appendChild(el('div', { color: DANGER, fontSize: '13px' },
+        'This course has no sections, so there is nowhere to put the enrollment.'));
+      return;
+    }
+    sectionBox.appendChild(el('div', {
+      fontWeight: '700', fontSize: '13px', margin: '0 0 6px'
+    }, 'Section (' + sections.length + ')'));
+
+    sections.forEach(function (s, i) {
+      var row = el('label', {
+        display: 'flex', gap: '8px', alignItems: 'flex-start',
+        padding: '7px 0', fontSize: '13px', lineHeight: '1.45', cursor: 'pointer',
+        borderTop: '1px solid ' + HAIR
+      });
+      var radio = el('input', { marginTop: '3px', flex: '0 0 auto' });
+      radio.type = 'radio';
+      radio.name = 'cbm-enroll-section';
+      radio.checked = (sections.length === 1 && i === 0);
+      if (radio.checked) { pickedSection = s; }
+      radio.addEventListener('change', function () {
+        pickedSection = s;
+        refreshPlan();
+      });
+      row.appendChild(radio);
+
+      var text = el('span');
+      text.appendChild(el('span', { fontWeight: '700' }, s.name || '(unnamed section)'));
+      text.appendChild(el('span', { color: MUTED },
+        '  \u00b7  SIS ' + (s.sis_section_id || 'none') +
+        '  \u00b7  id ' + s.id +
+        '  \u00b7  ' + (s.total_students != null ? s.total_students + ' students' : 'student count unknown')));
+      if (s.nonxlist_course_id) {
+        text.appendChild(el('div', { color: AMBER },
+          'Cross-listed in from course ' + s.nonxlist_course_id + '.'));
+      }
+      row.appendChild(text);
+      sectionBox.appendChild(row);
+    });
+
+    if (sections.length === 1) { pickedSection = sections[0]; }
+  }
+
+  /* ---------- CSV ------------------------------------------------------- */
+
+  function csvCell(v) {
+    v = String(v);
+    return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  }
+
+  function buildCsv() {
+    var cols = [], vals = [];
+
+    if (pickedSection.sis_section_id) {
+      cols.push('section_id'); vals.push(pickedSection.sis_section_id);
+    } else {
+      cols.push('canvas_section_id'); vals.push(pickedSection.id);
+    }
+
+    if (pickedUser.sis_user_id) {
+      cols.push('user_id'); vals.push(pickedUser.sis_user_id);
+    } else {
+      cols.push('canvas_user_id'); vals.push(pickedUser.id);
+    }
+
+    cols.push('role'); vals.push(roleField.select.value);
+    cols.push('status'); vals.push(statusField.select.value);
+
+    return cols.join(',') + '\n' + vals.map(csvCell).join(',') + '\n';
+  }
+
+  /* ---------- plan ------------------------------------------------------ */
+
+  function refreshPlan() {
+    actions.textContent = '';
+    csvBox.style.display = 'none';
+
+    if (!pickedUser) { say('Choose a person.', MUTED); return; }
+    if (!pickedCourse) { say('Choose a course.', MUTED); return; }
+    if (!sections.length) { say('Waiting on the section list.', MUTED); return; }
+    if (!pickedSection) { say('Choose which section the enrollment goes into.', MUTED); return; }
+
+    var csv = buildCsv();
+    csvBox.textContent = csv.replace(/\n$/, '');
+    csvBox.style.display = 'block';
+
+    var roleName = roleField.select.options[roleField.select.selectedIndex].textContent;
+    var removing = statusField.select.value === 'deleted';
+
+    if (removing) {
+      say('This removes ' + (pickedUser.name || pickedUser.sortable_name) +
+          ' as ' + roleName + ' from section "' + (pickedSection.name || pickedSection.id) +
+          '" in course ' + pickedCourse.id + '. Canvas deletes the enrollment and any ' +
+          'grades attached to it stop appearing in the gradebook. Deleted SIS enrollments ' +
+          'are not restorable from this panel.', DANGER);
+    } else {
+      say('This adds ' + (pickedUser.name || pickedUser.sortable_name) +
+          ' as ' + roleName + ' to section "' + (pickedSection.name || pickedSection.id) +
+          '" in course ' + pickedCourse.id + ' "' +
+          (pickedCourse.course_code || pickedCourse.name) + '", ' + termLabel(pickedCourse) + '. ' +
+          'It goes in as a SIS import, so it works on concluded and past-term courses. ' +
+          'The enrollment becomes SIS-managed, which means the instructor cannot remove it ' +
+          'and a future batch-mode SIS job over this term could sweep it. ' +
+          'Nobody gets a notification.');
+    }
+
+    var go = button(removing ? 'Remove the enrollment' : 'Add ' + roleName.toLowerCase() + ' to section',
+                    removing ? 'danger' : 'primary');
+    go.addEventListener('click', function () { submit(csv, go); });
+    actions.appendChild(go);
+
+    var openCourse = button('Open the section list');
+    openCourse.addEventListener('click', function () {
+      window.open(HOST + '/courses/' + pickedCourse.id + '/users', '_blank');
+    });
+    actions.appendChild(openCourse);
+  }
+
+  /* ---------- submit + poll --------------------------------------------- */
+
+  var TERMINAL = {
+    imported: 1, imported_with_messages: 1, failed: 1,
+    failed_with_messages: 1, aborted: 1
+  };
+
+  function submit(csv, go) {
+    go.disabled = true;
+    go.style.opacity = '.5';
+    go.style.cursor = 'default';
+    say('Sending the import\u2026', MUTED);
+
+    var startedAt = new Date();
+    var targetUser = pickedUser;
+    var targetSection = pickedSection;
+    var targetCourse = pickedCourse;
+    var targetRole = roleField.select.value;
+    var targetStatus = statusField.select.value;
+
+    postCsv('/api/v1/accounts/' + accountId +
+            '/sis_imports?import_type=instructure_csv&extension=csv', csv)
+      .then(function (imp) {
+        note('Import ' + imp.id + ' queued at ' + startedAt.toLocaleTimeString() + '.', BLUE);
+        return poll(imp.id, 0);
+      })
+      .then(function (imp) {
+        finish(imp, startedAt, targetUser, targetSection, targetCourse, targetRole, targetStatus);
+      })
+      .catch(function (err) {
+        say('The import did not run: ' + err.message, DANGER);
+        note('Failed: ' + err.message, DANGER);
+        go.disabled = false;
+        go.style.opacity = '1';
+        go.style.cursor = 'pointer';
+      });
+  }
+
+  function poll(importId, tries) {
+    if (tries > 72) {
+      return Promise.reject(new Error('The import is still running after three minutes. ' +
+        'Check Admin > SIS Import for import ' + importId + '.'));
+    }
+    return api('/api/v1/accounts/' + accountId + '/sis_imports/' + importId)
+      .then(function (imp) {
+        var state = imp.workflow_state || 'unknown';
+        say('Import ' + importId + ': ' + state.replace(/_/g, ' ') +
+            (imp.progress != null ? ', ' + imp.progress + '% done' : '') + '\u2026', MUTED);
+        if (TERMINAL[state]) { return imp; }
+        return new Promise(function (resolve) {
+          pollTimer = setTimeout(function () { resolve(poll(importId, tries + 1)); }, 2500);
+        });
+      });
+  }
+
+  function finish(imp, startedAt, user, section, course, role, status) {
+    var state = imp.workflow_state || 'unknown';
+    var ok = state === 'imported' || state === 'imported_with_messages';
+
+    (imp.processing_warnings || []).forEach(function (w) {
+      note('Warning: ' + (Array.isArray(w) ? w.join(' \u2014 ') : String(w)), AMBER);
+    });
+    (imp.processing_errors || []).forEach(function (e) {
+      note('Error: ' + (Array.isArray(e) ? e.join(' \u2014 ') : String(e)), DANGER);
+    });
+
+    var counts = imp.data && imp.data.counts;
+    if (counts && counts.enrollments != null) {
+      note('Canvas reports ' + counts.enrollments + ' enrollment row(s) processed.', MUTED);
+    }
+
+    if (!ok) {
+      say('Import ' + imp.id + ' finished as "' + state.replace(/_/g, ' ') +
+          '". Nothing was changed, or only part of it was. Read the messages above.', DANGER);
+      return;
+    }
+
+    say('Import ' + imp.id + ' finished. Checking the roster\u2026', MUTED);
+    verify(user, section, status).then(function (result) {
+      if (result.found) {
+        say('Done. ' + (user.name || user.sortable_name) + ' is on section "' +
+            (section.name || section.id) + '" with state "' + result.state + '".', GREEN);
+      } else if (status === 'deleted') {
+        say('Done. ' + (user.name || user.sortable_name) +
+            ' no longer holds that enrollment on section "' + (section.name || section.id) + '".', GREEN);
+      } else {
+        say('Import ' + imp.id + ' reported success, but the enrollment did not turn up on ' +
+            'the section roster. Open the section list and confirm before you tell anyone ' +
+            'it is done.', AMBER);
+      }
+      note(auditLine(startedAt, user, section, course, role, status, imp.id), MUTED);
+      addCopyButton(auditLine(startedAt, user, section, course, role, status, imp.id));
+    });
+  }
+
+  function verify(user, section, status) {
+    return api('/api/v1/sections/' + section.id + '/enrollments' +
+               '?per_page=100&state[]=active&state[]=invited&state[]=completed' +
+               '&user_id=' + encodeURIComponent(user.id))
+      .then(function (list) {
+        var hit = (list || []).filter(function (e) {
+          return String(e.user_id) === String(user.id);
+        })[0];
+        return hit
+          ? { found: true, state: hit.enrollment_state || 'unknown' }
+          : { found: false, state: null };
+      })
+      .catch(function () { return { found: false, state: null }; });
+  }
+
+  function auditLine(startedAt, user, section, course, role, status, importId) {
+    return [
+      startedAt.toISOString(),
+      'sis_import=' + importId,
+      'status=' + status,
+      'role=' + role,
+      'user=' + (user.sis_user_id || ('canvas:' + user.id)) + ' (' + (user.name || '') + ')',
+      'section=' + (section.sis_section_id || ('canvas:' + section.id)),
+      'course=' + course.id + ' ' + (course.sis_course_id || '')
+    ].join(' | ');
+  }
+
+  function addCopyButton(line) {
+    var copy = button('Copy the audit line');
+    copy.addEventListener('click', function () {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(line).then(function () {
+          copy.textContent = 'Copied';
+        });
+      }
+    });
+    actions.appendChild(copy);
+  }
+
+  /* ---------- start ------------------------------------------------------ */
+
+  document.body.appendChild(panel);
+  say('Finding an account to search\u2026', MUTED);
+  resolveAccount()
+    .then(function (id) {
+      headSub.textContent = 'Searching account ' + id + '. Writes go in as a SIS import.';
+      if (accountGuessed) {
+        note('You have admin rights on more than one account, and this page did not name ' +
+             'one, so the search and the SIS import both run against account ' + id + '. ' +
+             'If that is the wrong account, open the account you want in Canvas and click ' +
+             'the bookmarklet again from there.', AMBER);
+      }
+      userCombo.focus();
+      refreshPlan();
+    })
+    .catch(function (err) { say(err.message, DANGER); });
+})();
