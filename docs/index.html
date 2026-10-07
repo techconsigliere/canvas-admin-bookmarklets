@@ -130,6 +130,8 @@
 
   <h1>Canvas admin bookmarklets</h1>
   <p class="standfirst">Small browser tools that run inside a Canvas tab you are already signed in to. No tokens, no third parties, no remote code.</p>
+  <p class="drag-note">Teaching a course? The tools for your own courses are at
+    <a href="teacher/">Canvas teacher bookmarklets</a>.</p>
 
   <h2 style="border-top:0; padding-top:0; margin-top:0;">Cross-list sections</h2>
 
@@ -195,7 +197,7 @@
   <ul>
     <li><b>No tokens.</b> Authentication is the session cookie and <code>_csrf_token</code> cookie Canvas already set in your browser.</li>
     <li><b>No third parties.</b> Every request goes to the Canvas origin in your address bar, read at runtime from <code>location.origin</code>. Nothing leaves it.</li>
-    <li><b>No remote code.</b> No <code>eval</code>, no injected <code>&lt;script&gt;</code>, no injected <code>&lt;style&gt;</code>. The panel is built with DOM calls, which is also why it works under Content Security Policy.</li>
+    <li><b>No remote code.</b> No <code>eval</code>, no injected <code>&lt;script&gt;</code>, nothing fetched at runtime. The admin panels on this page are built entirely with DOM calls, which is also why they work under Content Security Policy.</li>
     <li><b>Your permissions still apply.</b> It calls the same API your account already has. If your role cannot cross-list, neither can this.</li>
   </ul>
 
