@@ -10,8 +10,8 @@ You should be skeptical of a stranger's JavaScript running against your producti
 
 - **No tokens.** There is no API key in any of these files. Authentication is your existing browser session cookie plus the `_csrf_token` cookie that Canvas already set.
 - **No third parties.** Every request goes to the Canvas origin in your address bar, resolved at runtime from `location.origin`. Nothing is sent anywhere else. There is no analytics, no telemetry, no phone-home.
-- **No remote code.** Nothing is fetched and executed. No `eval`, no injected `<script>` tag, no injected `<style>` element. Interfaces are built with DOM calls, which is also why they work on accounts with Content Security Policy turned on.
-- **Read the source.** `src/` holds the readable, commented original. `dist/` holds the same code with comments stripped and URL-encoded for the bookmark field. The build is mechanical and reproducible from the source.
+- **No remote code.** Nothing is fetched and executed. No `eval`, no injected `<script>` tag. The admin tools inject no `<style>` element either; their interfaces are built with DOM calls, which is also why they work on accounts with Content Security Policy turned on. Quiz accommodations is the exception: it adds a `<style>` element to its own panel, so a strict Content Security Policy can leave that panel unstyled, though it still works.
+- **Read the source.** `src/` holds the readable, commented original. `dist/` holds the same code, URL-encoded for the bookmark field, so each build decodes back to its source byte for byte. The build is mechanical and reproducible from the source.
 - **Your permissions still apply.** These call the same Canvas API your account already has. If your role cannot cross-list a section, neither can the bookmarklet.
 
 ## The tools
@@ -20,7 +20,7 @@ You should be skeptical of a stranger's JavaScript running against your producti
 
 Moves sections out of one or more secondary courses and into a primary course, in one pass, without walking the Canvas UI section by section.
 
-- **Version:** 2.1.0
+- **Version:** 2.1.1
 - **Where to run it:** any page on your Canvas instance. It works best from an account page, where it picks up the account ID from the URL.
 - **Permissions needed:** a role that can cross-list sections in the courses involved.
 - **Last tested:** 2026-09-18, Chrome and Firefox, against a Canvas production instance.
@@ -47,7 +47,7 @@ Every completed run also prints a copyable audit record: an ISO timestamp, the d
 
 Puts one person on one section in one role, or takes them off it, including in courses the enrollments API refuses to touch.
 
-- **Version:** 1.1.0
+- **Version:** 1.1.1
 - **Where to run it:** any page on your Canvas instance. It works best from the account page you actually mean, since SIS imports run at the account level.
 - **Permissions needed:** the Import SIS Data permission on your admin role.
 - **Last tested:** 2026-09-18, Chrome and Firefox, against a Canvas production instance.

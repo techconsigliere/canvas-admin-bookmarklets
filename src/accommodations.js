@@ -27,6 +27,8 @@
   'use strict';
 
   const TOOL_ID = 'qacc-tool';
+  const VERSION = '0.4.1';
+  const HOME = 'https://techconsigliere.github.io/canvas-admin-bookmarklets/teacher/';
   const CONCURRENCY = 3;        // reads in flight at once while loading
   const RATE_FLOOR = 150;       // pause briefly when X-Rate-Limit-Remaining drops below this
   const RATE_RETRIES = 3;       // retries after a rate-limit refusal
@@ -740,6 +742,8 @@
 #${TOOL_ID} button.secondary{background:#fff;color:#0374b5}
 #${TOOL_ID} button:disabled{opacity:.5;cursor:not-allowed}
 #${TOOL_ID} :focus-visible{outline:2px solid #0374b5;outline-offset:2px}
+#${TOOL_ID} .credit{padding:8px 18px;border-top:1px solid #c7cdd1;font-size:12px;color:#56606a}
+#${TOOL_ID} .credit a{color:#0374b5}
 #${TOOL_ID} input[type=search]{font:inherit;padding:5px 8px;width:min(320px,100%);
  border:1px solid #c7cdd1;border-radius:4px}
 `;
@@ -757,7 +761,12 @@
     el('header', {},
       heading,
       el('button', { type: 'button', class: 'secondary', onclick: close }, 'Close')),
-    panelBody);
+    panelBody,
+    // Credit line: tool, version, maker, and a way back to the install page.
+    // A plain link, so nothing is fetched or run.
+    el('footer', { class: 'credit' },
+      `Quiz accommodations ${VERSION} \u00b7 Technology Consigliere \u00b7 `,
+      el('a', { href: HOME, target: '_blank', rel: 'noopener noreferrer' }, 'Help and updates')));
 
   let running = false;
 

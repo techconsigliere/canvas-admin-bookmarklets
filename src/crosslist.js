@@ -25,6 +25,8 @@
      ------------------------------------------------------------------ */
 
   var PANEL_ID = 'cbm-xlist-panel';
+  var VERSION = '2.1.1';
+  var HOME = 'https://techconsigliere.github.io/canvas-admin-bookmarklets/';
   var already = document.getElementById(PANEL_ID);
   if (already) { already.remove(); return; }   // second click closes it
 
@@ -672,6 +674,18 @@
   }
 
   /* ---------- start -------------------------------------------------- */
+
+  // Credit line: tool, version, maker, and a way back to the install page.
+  // A plain link, so nothing is fetched or run. The version lets someone
+  // compare their installed bookmark against the page.
+  var credit = el('div', { fontSize: '12px', color: '#56606a', marginTop: '12px' },
+    'Cross-list sections ' + VERSION + ' \u00b7 Technology Consigliere \u00b7 ');
+  var creditLink = el('a', { color: BLUE }, 'Help and updates');
+  creditLink.href = HOME;
+  creditLink.target = '_blank';
+  creditLink.rel = 'noopener noreferrer';
+  credit.appendChild(creditLink);
+  foot.appendChild(credit);
 
   document.body.appendChild(panel);
   addSecondary();
